@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
+  <title>PUCmon</title>
+  <style>
+    /* PUCmon pixel style: cream paper, navy ink, the logo's mustard and sky blue; hard pixel borders and shadows. */
+    @font-face { font-family: "PUCmon Titulo"; src: url(fonts/PressStart2P-Regular.ttf); }
+    @font-face { font-family: "PUCmon Texto"; src: url(fonts/PixelifySans.ttf); font-weight: 400 700; }
+    :root { --creme: #EBE4DA; --papel: #F7F3EC; --noite: #101F3F; --mostarda: #E0B84F; --ceu: #5EAFD3; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--creme); }
+    #camerafeed, #unity-canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; }
+    #camerafeed { z-index: 0; }
+    #unity-canvas { z-index: 1; background: transparent; touch-action: none; }
+    #loading, #scan, #status { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 2; display: flex;
+      flex-direction: column; align-items: center; justify-content: center; gap: 24px; padding: 0 24px; color: var(--noite);
+      font: 500 17px/1.35 "PUCmon Texto", system-ui, sans-serif; text-align: center; pointer-events: none; transition: opacity .35s; }
+    #loading { background: var(--creme); pointer-events: auto; }  /* blocks taps on the game until it is shown */
+    #loading.off { pointer-events: none; }
+    #status:empty, .off { opacity: 0; }
+    .logo { width: min(80vw, 420px); image-rendering: pixelated; }
+    .title { font: 12px/1.6 "PUCmon Titulo", monospace; letter-spacing: 1px; }
+    /* A pixel box: navy border and hard navy shadow. */
+    .tag { background: var(--papel); border: 4px solid var(--noite); box-shadow: 4px 4px 0 var(--noite); padding: 10px 14px; max-width: 320px; }
+    .bar { width: min(64vw, 280px); height: 14px; padding: 3px; background: var(--papel); border: 4px solid var(--noite); box-shadow: 4px 4px 0 var(--noite); }
+    .bar i { display: block; height: 100%; width: 0; background: var(--mostarda); transition: width .2s steps(3); }
+    /* Scanning frame: four square corner brackets (navy, edged in cream so they show on any wall), gently breathing. */
+    .frame { position: relative; width: min(62vw, 300px); aspect-ratio: 3 / 4; animation: breathe 1.8s steps(6) infinite; }
+    .frame b { position: absolute; width: 40px; height: 40px; border: 0 solid var(--noite);
+      filter: drop-shadow(3px 0 0 var(--creme)) drop-shadow(-3px 0 0 var(--creme)) drop-shadow(0 3px 0 var(--creme)) drop-shadow(0 -3px 0 var(--creme)); }
+    .frame b:nth-child(1) { top: 0; left: 0; border-width: 8px 0 0 8px; }
+    .frame b:nth-child(2) { top: 0; right: 0; border-width: 8px 8px 0 0; }
+    .frame b:nth-child(3) { bottom: 0; right: 0; border-width: 0 8px 8px 0; }
+    .frame b:nth-child(4) { bottom: 0; left: 0; border-width: 0 0 8px 8px; }
+    @keyframes breathe { 50% { transform: scale(.95); } }
+    @media (prefers-reduced-motion: reduce) { .frame { animation: none; } }
+    #debug { position: fixed; top: 8px; left: 8px; z-index: 3; margin: 0; color: #fff; font: 11px/1.3 monospace;
+             pointer-events: none; text-shadow: 0 1px 3px #000; white-space: pre-wrap; }
+  </style>
+  <!-- 8th Wall open-source engine (MIT): camera, image target detection and tracking. "slam" = XrController chunk. -->
+  <script src="xr/xr.js" data-preload-chunks="slam"></script>
+</head>
+<body>
+  <canvas id="camerafeed"></canvas>
+  <canvas id="unity-canvas" tabindex="-1"></canvas>
+  <div id="loading"><img class="logo" src="logo.png" alt="PUCmon"><div class="bar"><i></i></div><div class="title">CARREGANDO...</div></div>
+  <div id="scan" class="off"><div class="frame"><b></b><b></b><b></b><b></b></div><div class="tag">Aponte a câmera para um cartaz PUCmon</div></div>
+  <div id="status"></div>
+  <pre id="debug"></pre>
+  <script src="Build/FreeWebAR.loader.js"></script>
+  <script type="module">
+    import {
+      toCardPose, mainBackCamera, pinCamera, frameIntrinsics, templateToCard, poseToHomography, homographyToPose,
+    } from './freewebar.js';
+    import { PlanarTracker, pyramid } from './tracker.js';
+
+    const q = new URLSearchParams(location.search);
+    const $ = id => document.getElementById(id);
+    const canvas = $('unity-canvas'), debug = $('debug');
+    // [tracked, position xyz, forward xyz, up xyz, projection (16, column-major GL), target index] in Unity camera
+    // space. FreeWebAR.jslib copies it into WebARImageTracker every frame.
+    const pose = window.freeWebARPose = new Float32Array(27);
+    let unityReady = false, gameReady = false, arStarted = false, cameraReady = false, failed = false, cameraLabel = '', cameraList = '', lastSeen = 0;
+    let sceneLoading = false;  // Unity is loading the AR scene (freeWebAROpen until freeWebARStart)
+    // The game says when its first screen knows what to show (e.g. after checking a saved session): PUCmon_PageReady.
+    window.pucmonPageReady = () => { gameReady = true; showHint(); };
+    const showHint = () => {
+      // before the AR scene only Unity counts
+      const ready = unityReady && gameReady && (cameraReady || !arStarted) && !failed && !sceneLoading;
+      $('loading').classList.toggle('off', ready || failed);
+      $('scan').classList.toggle('off', !ready || !arStarted || pose[0] === 1 || window.freeWebARHint === false);
+    };
+    const fail = message => {
+      failed = true;
+      const tag = document.createElement('div');
+      tag.className = 'tag';
+      tag.textContent = message;
+      $('status').replaceChildren(tag);
+      showHint();
+    };
+
+    // Dense tracking (tracker.js) on the exact camera frame shown on screen: the engine finds a poster, then every
+    // frame is aligned pixel by pixel against that poster's image. Its pose wins while the match (ZNCC) holds.
+    // One poster at a time: the one being followed stays until it is lost, then whichever the engine sees next.
+    const MIN_SCORE = 0.7;
+    let targets = [], active = -1, G = null, score = 0;
+
+    // image-targets/targets.json and the luminance images are written by the Unity build (ImageTargetBuild.cs),
+    // one per ImageTarget image in the scene.
+    async function loadTargets() {
+      const list = await (await fetch('image-targets/targets.json')).json();
+      targets = list.map(data => ({ name: data.name, card: templateToCard(data.properties), imagePath: data.imagePath, tracker: null }));
+      window.freeWebARTargets = targets.map(t => t.name);  // FreeWebAR_TargetName reads these
+      return list;
+    }
+    const indexOf = image => targets.findIndex(t => t.name === image.name);
+    // A poster's dense tracker is made the first time the engine sees it: decoding and preparing every poster up front
+    // held the camera back (~15 ms each on a computer, several times that on a phone). Until it is ready, a few
+    // frames, that poster goes by the engine's pose.
+    function prepare(target) {
+      target.loading ??= (async () => {
+        const bitmap = await createImageBitmap(await (await fetch(target.imagePath)).blob());
+        const c = document.createElement('canvas');
+        [c.width, c.height] = [bitmap.width, bitmap.height];
+        const ctx = c.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0);
+        const rgba = ctx.getImageData(0, 0, c.width, c.height).data, gray = new Uint8Array(c.width * c.height);
+        for (let i = 0; i < gray.length; i++) gray[i] = rgba[4 * i];  // already grayscale
+        target.tracker = new PlanarTracker({ data: gray, width: c.width, height: c.height });
+      })().catch(e => { console.warn('Free WebAR: no dense tracking for', target.name, e); });
+    }
+
+    // GL projection of a phone main camera (~63° across the long side) filling a w x h canvas.
+    function typicalLens(w, h) {
+      const t = Math.tan(63 * Math.PI / 360), fy = 1 / (t * Math.min(1, h / w)), fx = fy * h / w;
+      return [fx, 0, 0, 0, 0, fy, 0, 0, 0, 0, -1, -1, 0, 0, -0.02, 0];
+    }
+
+    const pool = {};  // pyramid buffers reused every frame
+    let lastGood = 0, lastUpdate = 0, fps = 0;
+    function track(r, images, cam) {
+      const K = frameIntrinsics(r.intrinsics, feed.width, feed.height, cam.cols, cam.rows);
+      let frame = null;  // built only for a frame with a poster to align
+      const attempt = (i, start) => {
+        const tracker = targets[i].tracker;
+        if (!tracker) {
+          prepare(targets[i]);
+          return null;
+        }
+        frame ??= pyramid({ data: cam.pixels, width: cam.cols, height: cam.rows }, undefined, pool);
+        const res = tracker.track(frame, start);
+        return res.score > MIN_SCORE && res.visible > 0.25 ? res : null;
+      };
+      // Follow the current poster from its last good alignment (kept for half a second after a miss: motion blur,
+      // a finger over the card), else (re)start from a poster the engine detects.
+      let res = G && attempt(active, G);
+      for (const image of res ? [] : images) {
+        const i = indexOf(image);
+        if (i >= 0 && (res = attempt(i, poseToHomography(toCardPose(r, image), K, targets[i].card)))) { active = i; break; }
+      }
+      const now = performance.now();
+      if (res) { G = res.G; lastGood = now; } else if (now - lastGood > 500) G = null;
+      score = res ? res.score : 0;
+      return res ? homographyToPose(res.G, K, targets[active].card) : null;
+    }
+
+    const unityBridge = {
+      name: 'unity-bridge',
+      onCameraStatusChange: ({ status: s, stream, video }) => {
+        if (stream) cameraLabel = stream.getVideoTracks()[0]?.label || '';
+        if (s === 'hasVideo') { cameraReady = true; if (video) cameraLabel += ` ${video.videoWidth}x${video.videoHeight}`; showHint(); }
+        if (s === 'failed') fail('Permita o acesso à câmera e recarregue a página.');
+      },
+      onUpdate: ({ processCpuResult, processGpuResult }) => {
+        const r = processCpuResult.reality;
+        if (!r) return;
+        // The engine's lens model; if it has none (seen when the camera starts with a 0x0 video), a typical phone lens.
+        if (!r.intrinsics?.every(Number.isFinite)) r.intrinsics = typicalLens(feed.width, feed.height);
+        pose.set(r.intrinsics, 10);
+        // The engine's far plane is infinite; give Unity a finite one (card units) so culling and depth behave.
+        const near = 0.05, far = 1000;
+        pose[20] = -(far + near) / (far - near);
+        pose[24] = -2 * far * near / (far - near);
+        const images = (r.detectedImages || []).filter(image => indexOf(image) >= 0);
+        const cam = processGpuResult?.camerapixelarray;
+        const t0 = performance.now();
+        const densePose = cam?.pixels && targets.length ? track(r, images, cam) : null;
+        let card = densePose;
+        if (!card && images.length) {  // dense alignment not holding: the engine's own pose
+          if (indexOf(images[0]) !== active) G = null;  // a different poster: the last alignment was for another image
+          active = indexOf(images[0]);
+          card = toCardPose(r, images[0]);
+        }
+        if (card) { pose[0] = 1; pose.set(card, 1); pose[26] = active; lastSeen = t0; }
+        else if (t0 - lastSeen > 250) pose[0] = 0;  // hold the last pose for a blink instead of flickering
+        showHint();
+        if (q.has('debug')) {
+          fps += (1000 / Math.max(1, t0 - lastUpdate) - fps) * 0.05;
+          lastUpdate = t0;
+          debug.textContent = `${cameraList}\naberta: ${cameraLabel}\n${fps.toFixed(0)} fps\n` +
+            `${densePose ? 'denso' : card ? '8th Wall' : 'procurando'}  ${card ? targets[active].name : ''}  ` +
+            `ZNCC ${score.toFixed(2)}  ${(performance.now() - t0).toFixed(1)} ms`;
+        }
+      },
+      onException: e => { console.error(e); fail(String(e.message || e)); },
+    };
+
+    // Camera feed canvas at the screen's resolution (up to 2x). The engine's FullWindowCanvas module would use 1x,
+    // which looks soft on phones, and moves the canvas above Unity's.
+    const feed = document.getElementById('camerafeed');
+    const sizeFeed = () => {
+      const dpr = Math.min(window.devicePixelRatio, 2);
+      feed.width = Math.round(innerWidth * dpr);
+      feed.height = Math.round(innerHeight * dpr);
+    };
+    sizeFeed();
+    addEventListener('resize', sizeFeed);
+
+    // Pin the main rear lens before the engine opens the camera (see mainBackCamera). Labels need camera permission,
+    // so on a first visit the camera is opened and closed once. ?cam=N forces the Nth camera listed by ?debug.
+    async function useMainLens() {
+      const md = navigator.mediaDevices;
+      const list = async () => (await md.enumerateDevices()).filter(d => d.kind === 'videoinput');
+      let cams = await list();
+      if (!cams.some(c => c.label)) {
+        (await md.getUserMedia({ video: { facingMode: 'environment' } })).getTracks().forEach(t => t.stop());
+        cams = await list();
+      }
+      const main = q.has('cam') ? cams[Number(q.get('cam'))] : mainBackCamera(cams);
+      if (main) pinCamera(md, main.deviceId);
+      cameraList = cams.map((c, i) => `${i}: ${c.label}${c === main ? ' ◀' : ''}`).join('\n');
+    }
+
+    // Once: pin the camera, load the image targets, set up the engine. Then it runs or stops with the AR scene.
+    async function setUpAR() {
+      const phone = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+        (/Mac/.test(navigator.platform) && navigator.maxTouchPoints > 1);  // iPadOS reports a Mac
+      if (phone || q.has('cam')) {
+        try {
+          await useMainLens();
+        } catch (e) {
+          if (e.name === 'NotAllowedError') return fail('Permita o acesso à câmera e recarregue a página.');
+          console.warn('Keeping the default camera:', e);
+        }
+      }
+      const imageTargetData = await loadTargets();
+      // No world tracking: the card is tracked from the image alone, never "slides" onto world anchors.
+      XR8.XrController.configure({ disableWorldTracking: true, leftHandedAxes: true, imageTargetData });
+      XR8.addCameraPipelineModules([
+        XR8.GlTextureRenderer.pipelineModule(),  // draws the camera behind the transparent Unity canvas
+        XR8.XrController.pipelineModule(),
+        // CPU copy of the frame for the dense tracker; the engine then shows that same frame, so pose and video match.
+        // After XrController: it leaves its framebuffer bound on the compute context.
+        XR8.CameraPixelArray.pipelineModule({ luminance: true, maxDimension: 480 }),
+        unityBridge,
+      ]);
+    }
+    // Leaving the AR scene pauses the engine, which releases the camera; coming back resumes it. (Stopping and running
+    // again would ask for motion permissions again, outside a tap, which iOS refuses.)
+    let setUp = null, engine = 'off';  // 'off', 'running' or 'paused'
+    async function startAR() {
+      if (!window.XR8) await new Promise(done => window.addEventListener('xrloaded', done, { once: true }));
+      await (setUp ??= setUpAR());
+      if (!arStarted || failed || engine === 'running') return;  // left the AR scene meanwhile
+      if (engine === 'paused') XR8.resume();
+      else XR8.run({ canvas: feed, allowedDevices: XR8.XrConfig.device().ANY });
+      engine = 'running';
+    }
+    // Unity opens the camera when the AR scene starts and closes it when the scene ends (FreeWebAR.jslib).
+    window.freeWebARStart = () => {
+      sceneLoading = false;
+      if (arStarted) return showHint();
+      arStarted = true;
+      sizeFeed();  // the page may have been sized while hidden or loading
+      showHint();
+      if (!window.isSecureContext) fail('A câmera só funciona em HTTPS.');
+      else startAR();
+    };
+    // Unity, right before loading the AR scene: the loading screen now, and the camera opening while the scene loads.
+    window.freeWebAROpen = () => {
+      window.freeWebARStart();
+      sceneLoading = true;
+      showHint();
+    };
+    window.freeWebARStop = () => {
+      arStarted = false;
+      pose[0] = 0;
+      if (engine === 'running') {
+        XR8.pause();
+        if (XR8.isPaused()) engine = 'paused';  // too early to pause: it just keeps running
+      }
+      showHint();
+    };
+
+    createUnityInstance(canvas, {
+      dataUrl: "Build/2830b3dbe93b863689eeb13a6becfd17.data.unityweb",
+      frameworkUrl: "Build/e2e15c3c41af5c4efe44436936170c50.js.unityweb",
+      codeUrl: "Build/f743f067e6202112535d34c515fb99d3.wasm.unityweb",
+      streamingAssetsUrl: "StreamingAssets",
+      companyName: "DefaultCompany",
+      productName: "PUCmon",
+      productVersion: "0.1",
+      devicePixelRatio: Math.min(window.devicePixelRatio, 2),
+      webglContextAttributes: { premultipliedAlpha: true, preserveDrawingBuffer: false, powerPreference: 2 },  // 2 = high-performance
+    }, progress => { document.querySelector('.bar i').style.width = `${Math.round(progress * 100)}%`; })
+      .then(() => { unityReady = true; showHint(); })
+      .catch(e => { console.error(e); fail(String(e.message || e)); });
+  </script>
+</body>
+</html>
